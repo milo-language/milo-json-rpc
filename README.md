@@ -4,12 +4,12 @@ JSON-RPC 2.0 for [Milo](https://github.com/milo-language/milo): Content-Length b
 framing over any fd, request/response/notification envelopes, id correlation, and the spec's
 standard error codes. No dependencies beyond the standard library.
 
-**Not published yet.** Depend on it by local path until it has a real home:
+Add it to your `milo.json`:
 
 ```json
 {
   "deps": {
-    "json-rpc": "../../path/to/milo-json-rpc"
+    "json-rpc": "github.com/milo-language/milo-json-rpc@v0.1.0"
   }
 }
 ```
