@@ -1,0 +1,291 @@
+// Byte-level framing tests. Every negative case asserts a SPECIFIC FrameError,
+// not just "not Ok" — a transport that reports the wrong failure (or silently
+// hands back an empty/truncated string) is exactly the defect this package
+// exists to rule out. See design note in frame.milo for why header matching
+// is case-insensitive.
+from "std/platform" import {
+    pipe, close
+}
+from "std/os" import {
+    writeFd
+}
+from "std/runtime" import {
+    Task, schedulerRunToCompletion
+}
+from "std/time" import {
+    sleepMs
+}
+from "std/testing" import {
+    assertTrue, assertStrEqual, assertEqual64
+}
+from "json-rpc/frame" import {
+    FrameError, readFrame, writeFrame
+}
+
+struct PipePair {
+    r: i32,
+    w: i32,
+}
+
+fn newPipe(): PipePair {
+    var fds: [u8; 8] = [0; 8]
+    var r: i32 = 0
+    var w: i32 = 0
+    unsafe {
+        pipe(fds as *i32)
+        let p = fds as *i32
+        r = p[0]
+        w = p[1]
+    }
+    return PipePair {
+        r: r, w: w
+    }
+}
+
+fn isErr(res: &Result<string, FrameError>, want: FrameError): bool {
+    match res {
+        Result.Err(e) => {
+            match e {
+                FrameError.Eof => {
+                    return want == FrameError.Eof
+                }
+                FrameError.MissingContentLength => {
+                    return want == FrameError.MissingContentLength
+                }
+                FrameError.MalformedLength => {
+                    return want == FrameError.MalformedLength
+                }
+                FrameError.TruncatedBody => {
+                    return want == FrameError.TruncatedBody
+                }
+                FrameError.ShortWrite => {
+                    return want == FrameError.ShortWrite
+                }
+            }
+        }
+        Result.Ok(_v) => {
+            return false
+        }
+    }
+}
+
+// exact byte-level round-trip: what writeFrame puts on the wire is exactly
+// what readFrame hands back, unchanged.
+fn testRoundTrip(): void {
+    let pp = newPipe()
+    let payload: string = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"add\",\"params\":[1,2]}"
+    match writeFrame(pp.w, payload) {
+        Result.Ok(_n) => {
+        }
+        Result.Err(_e) => {
+            assertTrue(false)
+        }
+    }
+    close(pp.w)
+    match readFrame(pp.r) {
+        Result.Ok(got) => {
+            assertStrEqual(got, payload)
+        }
+        Result.Err(_e) => {
+            assertTrue(false)
+        }
+    }
+    close(pp.r)
+}
+
+// A message delivered across multiple read()s — header and body each arrive
+// in separate write()s with a real scheduler yield between them, so the
+// reader genuinely parks and resumes rather than finding everything already
+// buffered in one shot.
+fn testSplitAcrossReads(): void {
+    let pp = newPipe()
+    let body: string = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\",\"params\":{}}"
+    let header: string = $"Content-Length: {body.len}\r\n\r\n"
+    let half = body.len / 2
+    let part1: string = body[0..half].clone()
+    let part2: string = body[half..body.len].clone()
+    let headerPart1: string = header[0..10].clone()
+    let headerPart2: string = header[10..header.len].clone()
+
+    Task.spawn(move(): void => {
+        writeFd(pp.w, headerPart1, headerPart1.len)
+        sleepMs(5)
+        writeFd(pp.w, headerPart2, headerPart2.len)
+        sleepMs(5)
+        writeFd(pp.w, part1, part1.len)
+        sleepMs(5)
+        writeFd(pp.w, part2, part2.len)
+        close(pp.w)
+    }
+    )
+
+    let expected: string = body.clone()
+    Task.spawn(move(): void => {
+        match readFrame(pp.r) {
+            Result.Ok(got) => {
+                assertStrEqual(got, expected)
+            }
+            Result.Err(_e) => {
+                assertTrue(false)
+            }
+        }
+        close(pp.r)
+    }
+    )
+
+    schedulerRunToCompletion()
+}
+
+// The base protocol treats header names as case-insensitive (LSP/DAP share
+// this base protocol verbatim); a peer sending "content-length" lowercase is
+// compliant, not malformed. This is the one place this package's behavior
+// deliberately differs from the java-dap/dapweb code it replaces.
+fn testUnexpectedHeaderCasing(): void {
+    let pp = newPipe()
+    let msg: string = "content-length: 5\r\n\r\nhello"
+    writeFd(pp.w, msg, msg.len)
+    close(pp.w)
+    match readFrame(pp.r) {
+        Result.Ok(got) => {
+            assertStrEqual(got, "hello")
+        }
+        Result.Err(_e) => {
+            assertTrue(false)
+        }
+    }
+    close(pp.r)
+}
+
+fn testUnexpectedHeaderCasingUpper(): void {
+    let pp = newPipe()
+    let msg: string = "CONTENT-LENGTH: 2\r\n\r\nhi"
+    writeFd(pp.w, msg, msg.len)
+    close(pp.w)
+    match readFrame(pp.r) {
+        Result.Ok(got) => {
+            assertStrEqual(got, "hi")
+        }
+        Result.Err(_e) => {
+            assertTrue(false)
+        }
+    }
+    close(pp.r)
+}
+
+// A truncated body must fail closed as TruncatedBody, never hand back the
+// partial bytes it did receive dressed up as a complete (just short) frame.
+fn testTruncatedBody(): void {
+    let pp = newPipe()
+    let msg: string = "Content-Length: 100\r\n\r\nonly ten!!"
+    writeFd(pp.w, msg, msg.len)
+    close(pp.w)
+    let res = readFrame(pp.r)
+    assertTrue(isErr(res, FrameError.TruncatedBody))
+    close(pp.r)
+}
+
+// Stream closes before the header terminator ever appears.
+fn testEofMidHeader(): void {
+    let pp = newPipe()
+    let msg: string = "Content-Le"
+    writeFd(pp.w, msg, msg.len)
+    close(pp.w)
+    let res = readFrame(pp.r)
+    assertTrue(isErr(res, FrameError.Eof))
+    close(pp.r)
+}
+
+// A complete, well-terminated header block that never mentions
+// Content-Length at all — distinct from a malformed value.
+fn testMissingContentLength(): void {
+    let pp = newPipe()
+    let msg: string = "X-Custom: 1\r\n\r\nbody"
+    writeFd(pp.w, msg, msg.len)
+    close(pp.w)
+    let res = readFrame(pp.r)
+    assertTrue(isErr(res, FrameError.MissingContentLength))
+    close(pp.r)
+}
+
+// Content-Length present but its value isn't a valid integer.
+fn testMalformedLength(): void {
+    let pp = newPipe()
+    let msg: string = "Content-Length: abc\r\n\r\nbody"
+    writeFd(pp.w, msg, msg.len)
+    close(pp.w)
+    let res = readFrame(pp.r)
+    assertTrue(isErr(res, FrameError.MalformedLength))
+    close(pp.r)
+}
+
+// The classic framing bug: a naive implementation re-scans the buffer for
+// "\r\n\r\n" to find the body end instead of trusting the declared
+// Content-Length, and truncates the body at a \r\n\r\n sequence that occurs
+// naturally inside a JSON string value. This body contains one on purpose,
+// declared at its true full length.
+fn testEmbeddedCrlfCrlfInBody(): void {
+    let pp = newPipe()
+    let body: string = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"note\":\"line1\\r\\n\\r\\nline2\"}}"
+    let msg: string = $"Content-Length: {body.len}\r\n\r\n" + body
+    writeFd(pp.w, msg, msg.len)
+    close(pp.w)
+    match readFrame(pp.r) {
+        Result.Ok(got) => {
+            assertStrEqual(got, body)
+            assertEqual64(got.len, body.len)
+        }
+        Result.Err(_e) => {
+            assertTrue(false)
+        }
+    }
+    close(pp.r)
+}
+
+// A second frame immediately following the first must not be disturbed by
+// the embedded-CRLFCRLF body that precedes it — proves the reader consumed
+// exactly the declared byte count and no more.
+fn testEmbeddedCrlfCrlfThenAnotherFrame(): void {
+    let pp = newPipe()
+    let body1: string = "{\"a\":\"x\\r\\n\\r\\ny\"}"
+    let msg1: string = $"Content-Length: {body1.len}\r\n\r\n" + body1
+    let body2: string = "{\"b\":2}"
+    let msg2: string = $"Content-Length: {body2.len}\r\n\r\n" + body2
+    writeFd(pp.w, msg1, msg1.len)
+    writeFd(pp.w, msg2, msg2.len)
+    close(pp.w)
+    match readFrame(pp.r) {
+        Result.Ok(got1) => {
+            assertStrEqual(got1, body1)
+        }
+        Result.Err(_e) => {
+            assertTrue(false)
+        }
+    }
+    match readFrame(pp.r) {
+        Result.Ok(got2) => {
+            assertStrEqual(got2, body2)
+        }
+        Result.Err(_e) => {
+            assertTrue(false)
+        }
+    }
+    close(pp.r)
+}
+
+// A zero-length body is well-formed, not an error and not indistinguishable
+// from "no message" — Content-Length: 0 is valid per spec.
+fn testZeroLengthBody(): void {
+    let pp = newPipe()
+    let msg: string = "Content-Length: 0\r\n\r\n"
+    writeFd(pp.w, msg, msg.len)
+    close(pp.w)
+    match readFrame(pp.r) {
+        Result.Ok(got) => {
+            assertStrEqual(got, "")
+        }
+        Result.Err(_e) => {
+            assertTrue(false)
+        }
+    }
+    close(pp.r)
+}

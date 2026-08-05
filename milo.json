@@ -1,0 +1,9 @@
+{
+  "name": "json-rpc",
+  "version": "0.1.0",
+  "description": "JSON-RPC 2.0 transport over Content-Length framing — LSP/DAP base protocol, any fd",
+  "license": "MIT",
+  "lib": "lib.milo",
+  "targets": ["darwin", "linux", "windows"],
+  "exclude": ["tests/**"]
+}

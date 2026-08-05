@@ -1,0 +1,140 @@
+// JSON-RPC 2.0 envelope tests: id round-trips as number OR string, builders
+// produce well-formed envelopes, parseMessage classifies correctly, and
+// malformed/incomplete bodies come back Malformed rather than a best guess.
+from "std/testing" import {
+    assertTrue, assertStrEqual, assertEqual64
+}
+from "std/json" import {
+    Json
+}
+from "json-rpc" import {
+    RpcId, RpcMessage, parseMessage, buildRequest, buildNotification, buildResponse,
+    buildErrorResponse, rpcError, rpcErrorWithData, rpcIdEq,
+    PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR
+}
+
+fn testStandardErrorCodes(): void {
+    assertEqual64(PARSE_ERROR, (-32700 as i64))
+    assertEqual64(INVALID_REQUEST, (-32600 as i64))
+    assertEqual64(METHOD_NOT_FOUND, (-32601 as i64))
+    assertEqual64(INVALID_PARAMS, (-32602 as i64))
+    assertEqual64(INTERNAL_ERROR, (-32603 as i64))
+}
+
+fn testRequestRoundTripsNumericId(): void {
+    let json = buildRequest(RpcId.IdNum(42), "add", "[1,2]")
+    match parseMessage(json) {
+        RpcMessage.Request(r) => {
+            assertTrue(rpcIdEq(r.id, RpcId.IdNum(42)))
+            assertStrEqual(r.method, "add")
+            assertTrue(r.hasParams)
+        }
+        _ => {
+            assertTrue(false)
+        }
+    }
+}
+
+// A client that sent its id as a JSON string must get that same string back,
+// not "42" collapsed from a number — the spec treats these as distinct ids.
+fn testRequestRoundTripsStringId(): void {
+    let json = buildRequest(RpcId.IdStr("req-abc"), "ping", "{}")
+    match parseMessage(json) {
+        RpcMessage.Request(r) => {
+            assertTrue(rpcIdEq(r.id, RpcId.IdStr("req-abc")))
+        }
+        _ => {
+            assertTrue(false)
+        }
+    }
+}
+
+fn testNotificationHasNoId(): void {
+    let json = buildNotification("didChange", "{\"x\":1}")
+    match parseMessage(json) {
+        RpcMessage.Notification(n) => {
+            assertStrEqual(n.method, "didChange")
+            assertTrue(n.hasParams)
+        }
+        _ => {
+            assertTrue(false)
+        }
+    }
+}
+
+fn testResponseRoundTrips(): void {
+    let json = buildResponse(RpcId.IdNum(9), "{\"sum\":3}")
+    match parseMessage(json) {
+        RpcMessage.Response(r) => {
+            assertTrue(rpcIdEq(r.id, RpcId.IdNum(9)))
+            let sum = r.result.i64("sum") ?? (0 as i64)
+            assertEqual64(sum, (3 as i64))
+        }
+        _ => {
+            assertTrue(false)
+        }
+    }
+}
+
+fn testErrorResponseRoundTrips(): void {
+    let err = rpcError(METHOD_NOT_FOUND, "unknown method: frobnicate")
+    let json = buildErrorResponse(RpcId.IdNum(5), err)
+    match parseMessage(json) {
+        RpcMessage.ErrorResponse(e) => {
+            assertTrue(rpcIdEq(e.id, RpcId.IdNum(5)))
+            assertEqual64(e.error.code, METHOD_NOT_FOUND)
+            assertStrEqual(e.error.message, "unknown method: frobnicate")
+        }
+        _ => {
+            assertTrue(false)
+        }
+    }
+}
+
+fn testErrorResponseWithData(): void {
+    let data = Json.obj().str("detail", "bad range").build()
+    let err = rpcErrorWithData(INVALID_PARAMS, "invalid params", data)
+    let json = buildErrorResponse(RpcId.IdStr("r1"), err)
+    assertTrue(json.contains("\"data\""))
+    match parseMessage(json) {
+        RpcMessage.ErrorResponse(e) => {
+            assertEqual64(e.error.code, INVALID_PARAMS)
+        }
+        _ => {
+            assertTrue(false)
+        }
+    }
+}
+
+// Not valid JSON at all — Malformed, not a crash and not an empty success.
+fn testMalformedNotJson(): void {
+    let bogus: string = "not json at all {{{"
+    match parseMessage(bogus) {
+        RpcMessage.Malformed => {
+        }
+        _ => {
+            assertTrue(false)
+        }
+    }
+}
+
+// Valid JSON, but no method AND no result/error — nothing to dispatch and
+// nothing to correlate. Must not be silently treated as any variant.
+fn testMalformedNoMethodNoResult(): void {
+    let bogus: string = "{\"jsonrpc\":\"2.0\",\"id\":1}"
+    match parseMessage(bogus) {
+        RpcMessage.Malformed => {
+        }
+        _ => {
+            assertTrue(false)
+        }
+    }
+}
+
+// A well-formed request has no top-level "jsonrpc" field in this test on
+// purpose: parseMessage classifies by shape (id/method/result/error), not by
+// checking the version string — a peer that omits it is still dispatchable.
+fn testRequestBuilderIncludesJsonrpcVersion(): void {
+    let json = buildRequest(RpcId.IdNum(1), "x", "null")
+    assertTrue(json.contains("\"jsonrpc\":\"2.0\""))
+}

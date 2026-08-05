@@ -1,0 +1,7 @@
+{
+  "name": "json-rpc-tests",
+  "version": "0.0.0",
+  "deps": {
+    "json-rpc": "../"
+  }
+}

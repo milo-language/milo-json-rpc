@@ -1,0 +1,73 @@
+// In-flight request correlation: register an id when you send a request,
+// take() it back when the matching response (or reverse-request answer)
+// arrives. Generic over RpcId rather than over JSON-RPC's envelope, so it is
+// the one piece of this package a DAP client can reuse directly — DAP's
+// reverse requests (server → client, e.g. runInTerminal) correlate the same
+// way JSON-RPC does, by echoing a numeric seq back in request_seq. A DAP
+// consumer wraps its i64 seq as RpcId.IdNum(seq) and gets the same table;
+// nothing here assumes the envelope those ids came from.
+//
+// An id is a number OR a string (see RpcId), and HashMap needs one concrete
+// key type, so this keeps two maps rather than one keyed by a hand-rolled
+// RpcId hash. Any single request is in exactly one, so lookups never search
+// the wrong table.
+from "json-rpc" import {
+    RpcId
+}
+
+pub struct PendingRequests<T> {
+    numeric: HashMap<i64, T>,
+    keyed: HashMap<string, T>,
+    nextNum: i64,
+}
+
+impl PendingRequests<T> {
+    fn new(): PendingRequests<T> {
+        return PendingRequests {
+            numeric: HashMap.new(), keyed: HashMap.new(), nextNum: 1
+        }
+    }
+
+    // A fresh numeric id, monotonically increasing. Callers that want string
+    // ids (some JSON-RPC clients use UUIDs) build their own RpcId.IdStr and
+    // skip this.
+    fn nextId(self: &mut Self): RpcId {
+        let n = self.nextNum
+        self.nextNum = self.nextNum + 1
+        return RpcId.IdNum(n)
+    }
+
+    fn register(self: &mut Self, id: RpcId, val: T): void {
+        match id {
+            RpcId.IdNum(n) => {
+                self.numeric.insert(n, val)
+            }
+            RpcId.IdStr(s) => {
+                self.keyed.insert(s, val)
+            }
+        }
+    }
+
+    fn len(self: &Self): i64 {
+        return self.numeric.len + self.keyed.len
+    }
+
+    // Remove and return the value registered under `id`, or None if no
+    // in-flight request has that id — a caller correlating a response that
+    // matches nothing in flight (duplicate reply, unknown id, id from a
+    // previous session) needs to be able to tell that apart from "found it".
+    fn take(self: &mut Self, id: &RpcId): Option<T> {
+        match id {
+            RpcId.IdNum(n) => {
+                let v = self.numeric.get(n)
+                self.numeric.remove(n)
+                return v
+            }
+            RpcId.IdStr(s) => {
+                let v = self.keyed.get(s.clone())
+                self.keyed.remove(s.clone())
+                return v
+            }
+        }
+    }
+}

@@ -1,0 +1,162 @@
+// Content-Length base-protocol framing, the wire format LSP and DAP both
+// specify verbatim:
+//
+//   Content-Length: <N>\r\n\r\n<N bytes of UTF-8 JSON>
+//
+// Transport only — the JSON body is opaque here, and there is nothing DAP-
+// or LSP-shaped in this file. Read/write over any fd (stdio, socket, pipe);
+// the green/blocking read strategy is entirely FdReader's problem, so
+// nothing below ever branches on "am I in a green task?".
+//
+// Every failure is a distinct FrameError, never an empty string standing in
+// for "something went wrong" — a caller that only checks Result.Ok/Err (as
+// every known consumer does) gets the same fail-closed behavior either way,
+// but one that inspects the error gets to say why.
+from "std/platform" import {
+    write
+}
+from "std/io" import {
+    FdReader, fdReaderAttach
+}
+
+pub enum FrameError {
+    Eof, // stream closed before a header or body completed
+    MissingContentLength, // header block had no Content-Length line
+    MalformedLength, // Content-Length's value wasn't a valid non-negative integer
+    TruncatedBody, // stream ended before the declared byte count arrived
+    ShortWrite, // write() accepted fewer bytes than the framed message
+}
+
+pub fn frameErrorMessage(e: &FrameError): string {
+    match e {
+        FrameError.Eof => {
+            return "connection closed mid-frame"
+        }
+        FrameError.MissingContentLength => {
+            return "header block has no Content-Length"
+        }
+        FrameError.MalformedLength => {
+            return "Content-Length value is not a valid integer"
+        }
+        FrameError.TruncatedBody => {
+            return "stream ended before the declared body length"
+        }
+        FrameError.ShortWrite => {
+            return "write() accepted fewer bytes than the framed message"
+        }
+    }
+}
+
+// Read one complete framed message off fd, returning the raw JSON body.
+// Blocks (or parks, inside a green task) until a full frame arrives.
+pub fn readFrame(fd: i32): Result<string, FrameError> {
+    let reader = fdReaderAttach(fd)
+    return readFrameWith(reader)
+}
+
+// Same as readFrame, but over a caller-held FdReader — use this in a loop
+// that reads many frames off the same fd, so each call doesn't re-derive the
+// Green/Blocking mode from scheduler state.
+pub fn readFrameWith(reader: &FdReader): Result<string, FrameError> {
+    match _readHeader(reader) {
+        Result.Err(e) => {
+            return Result.Err(e)
+        }
+        Result.Ok(header) => {
+            match _parseContentLength(header) {
+                Result.Err(e) => {
+                    return Result.Err(e)
+                }
+                Result.Ok(len) => {
+                    match reader.readExact(len) {
+                        Result.Ok(body) => {
+                            return Result.Ok(body)
+                        }
+                        Result.Err(_e) => {
+                            // readExact only fails on early EOF: the stream
+                            // ended after promising `len` bytes but before
+                            // delivering them. Report that specifically
+                            // rather than handing back a short string that
+                            // looks like a complete (just small) body.
+                            return Result.Err(FrameError.TruncatedBody)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Frame and write a payload as ONE write(): callers may share an fd between two
+// green tasks (odd/even seq split), and a single write() to a blocking pipe
+// can't interleave under the cooperative scheduler — a looping/partial write
+// could. A short write (nonblocking fd, full buffer) is reported as an error
+// rather than silently retried, preserving that all-or-nothing framing.
+pub fn writeFrame(fd: i32, payload: &string): Result<i64, FrameError> {
+    let msg = $"Content-Length: {payload.len}\r\n\r\n" + payload
+    let n = write(fd, msg, msg.len)
+    if n < msg.len as i64 {
+        return Result.Err(FrameError.ShortWrite)
+    }
+    return Result.Ok(n)
+}
+
+// Accumulate bytes until the CRLFCRLF header terminator, tracking only the
+// trailing 4 bytes seen so far — no rescanning the growing buffer per byte.
+fn _readHeader(reader: &FdReader): Result<string, FrameError> {
+    var header: string = String.withCapacity(64)
+    var c0: i64 = 0
+    var c1: i64 = 0
+    var c2: i64 = 0
+    var c3: i64 = 0
+    while true {
+        let b = reader.readByte()
+        if b < 0 {
+            return Result.Err(FrameError.Eof)
+        }
+        header.push(b as u8)
+        c0 = c1
+        c1 = c2
+        c2 = c3
+        c3 = b
+        if c0 == 13 && c1 == 10 && c2 == 13 && c3 == 10 {
+            return Result.Ok(header)
+        }
+    }
+    return Result.Err(FrameError.Eof)
+}
+
+// Extract the integer after "Content-Length:". Case-insensitive: the base
+// protocol (LSP §Base Protocol, which DAP borrows wholesale) treats header
+// field names as HTTP-style and case-insensitive, so a peer sending
+// "content-length" or "CONTENT-LENGTH" is compliant, not malformed. Matching
+// only the exact case "Content-Length" — as this package's own prior art in
+// java-dap and dapweb both did — rejects a conformant peer.
+fn _parseContentLength(header: &string): Result<i64, FrameError> {
+    let lower = header.toLower()
+    let needle: string = "content-length:"
+    let idxOpt = lower.indexOf(needle)
+    if idxOpt.isNone() {
+        return Result.Err(FrameError.MissingContentLength)
+    }
+    let idx = idxOpt!
+    var i = idx + needle.len
+    while i < header.len && header[i] == 32 {
+        i = i + 1
+    }
+    var n: i64 = 0
+    var sawDigit = false
+    while i < header.len {
+        let ch = header[i]
+        if ch < 48 || ch > 57 {
+            break
+        }
+        n = n * 10 + ((ch - 48) as i64)
+        sawDigit = true
+        i = i + 1
+    }
+    if !sawDigit {
+        return Result.Err(FrameError.MalformedLength)
+    }
+    return Result.Ok(n)
+}

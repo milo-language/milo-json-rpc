@@ -1,0 +1,99 @@
+// In-flight request correlation table tests.
+from "std/testing" import {
+    assertTrue, assertEqual64
+}
+from "json-rpc" import {
+    RpcId, rpcIdEq
+}
+from "json-rpc/pending" import {
+    PendingRequests
+}
+
+fn testRegisterThenTake(): void {
+    var p: PendingRequests<string> = PendingRequests<string>.new()
+    let id = p.nextId()
+    p.register(id.clone(), "add")
+    match p.take(id) {
+        Option.Some(_method) => {
+        }
+        Option.None => {
+            assertTrue(false)
+        }
+    }
+}
+
+// Taking an id that was never registered — including one shaped like a real
+// one — must report None, not fabricate a value or take an unrelated entry.
+fn testTakeUnknownIdIsNone(): void {
+    var p: PendingRequests<i32> = PendingRequests<i32>.new()
+    let id = p.nextId()
+    p.register(id, 1)
+    match p.take(RpcId.IdNum(999)) {
+        Option.Some(_v) => {
+            assertTrue(false)
+        }
+        Option.None => {
+        }
+    }
+}
+
+// take() removes: a second take on the same id must also miss.
+fn testTakeIsOneShot(): void {
+    var p: PendingRequests<i32> = PendingRequests<i32>.new()
+    let id = p.nextId()
+    p.register(id.clone(), 7)
+    match p.take(id.clone()) {
+        Option.Some(v) => {
+            assertEqual64(v as i64, (7 as i64))
+        }
+        Option.None => {
+            assertTrue(false)
+        }
+    }
+    match p.take(id) {
+        Option.Some(_v) => {
+            assertTrue(false)
+        }
+        Option.None => {
+        }
+    }
+}
+
+fn testNextIdMonotonic(): void {
+    var p: PendingRequests<i32> = PendingRequests<i32>.new()
+    let a = p.nextId()
+    let b = p.nextId()
+    assertTrue(!rpcIdEq(a, b))
+}
+
+fn testStringIdWorksAlongsideNumeric(): void {
+    var p: PendingRequests<i32> = PendingRequests<i32>.new()
+    p.register(RpcId.IdNum(1), 10)
+    p.register(RpcId.IdStr("s1"), 20)
+    match p.take(RpcId.IdStr("s1")) {
+        Option.Some(v) => {
+            assertEqual64(v as i64, (20 as i64))
+        }
+        Option.None => {
+            assertTrue(false)
+        }
+    }
+    match p.take(RpcId.IdNum(1)) {
+        Option.Some(v) => {
+            assertEqual64(v as i64, (10 as i64))
+        }
+        Option.None => {
+            assertTrue(false)
+        }
+    }
+}
+
+fn testLenTracksRegistrations(): void {
+    var p: PendingRequests<i32> = PendingRequests<i32>.new()
+    assertEqual64(p.len(), (0 as i64))
+    p.register(RpcId.IdNum(1), 1)
+    p.register(RpcId.IdStr("x"), 2)
+    assertEqual64(p.len(), (2 as i64))
+    let _ = p.take(RpcId.IdNum(1))
+    assertEqual64(p.len(), (1 as i64))
+}

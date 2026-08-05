@@ -1,0 +1,272 @@
+// JSON-RPC 2.0 envelopes: request / response / notification, id correlation,
+// and the spec's standard error codes (§5.1). Framing (Content-Length over a
+// byte stream) lives in "json-rpc/frame" — this file is what sits on top of
+// a frame's raw JSON body once you have one.
+//
+// Deliberately silent on method names and param shapes: a router keyed by
+// method string, registered by the caller, is how LSP and a from-scratch
+// JSON-RPC service both dispatch — this package supplies the envelope, not
+// an opinion about what "initialize" or "add" means. DAP does NOT sit on
+// this file: its wire envelope (seq/command/arguments/request_seq/success)
+// predates and diverges from JSON-RPC 2.0, so forcing it through these
+// builders would either misrepresent the DAP wire format or leak DAP field
+// names in here. DAP gets the framing module only; see pending.milo for the
+// one piece (id correlation) shaped generically enough for DAP's reverse
+// requests to reuse if a consumer ever needs that.
+from "std/json" import {
+    Json, JsonObj
+}
+
+// A JSON-RPC id is a number OR a string on the wire (spec §4) — collapsing
+// both to string would hand a client back `"3"` for a request it sent as the
+// number `3`, which is a protocol violation, not a formatting choice.
+pub enum RpcId {
+    IdNum(i64),
+    IdStr(string),
+}
+
+impl RpcId {
+    // Enums only get a compiler-synthesized `.clone()` when every variant is
+    // Copy (see the language reference's Copy rules); IdStr's string payload
+    // isn't, so this package supplies one explicitly rather than leaving a
+    // caller who wants to keep an id after handing it to e.g.
+    // PendingRequests.register with no way to do that but a hand-rolled match.
+    fn clone(self: &Self): RpcId {
+        match self {
+            RpcId.IdNum(n) => {
+                return RpcId.IdNum(n)
+            }
+            RpcId.IdStr(s) => {
+                return RpcId.IdStr(s.clone())
+            }
+        }
+    }
+}
+
+pub fn rpcIdEq(a: &RpcId, b: &RpcId): bool {
+    match a {
+        RpcId.IdNum(an) => {
+            match b {
+                RpcId.IdNum(bn) => {
+                    return an == bn
+                }
+                RpcId.IdStr(_bs) => {
+                    return false
+                }
+            }
+        }
+        RpcId.IdStr(as_) => {
+            match b {
+                RpcId.IdNum(_bn) => {
+                    return false
+                }
+                RpcId.IdStr(bs) => {
+                    return as_ == bs
+                }
+            }
+        }
+    }
+}
+
+fn idField(o: JsonObj, id: &RpcId): JsonObj {
+    match id {
+        RpcId.IdNum(n) => {
+            return o.int("id", n)
+        }
+        RpcId.IdStr(s) => {
+            return o.str("id", s.clone())
+        }
+    }
+}
+
+// ── Standard error codes (JSON-RPC 2.0 spec §5.1) ──
+pub let PARSE_ERROR: i64 = -32700
+
+pub let INVALID_REQUEST: i64 = -32600
+
+pub let METHOD_NOT_FOUND: i64 = -32601
+
+pub let INVALID_PARAMS: i64 = -32602
+
+pub let INTERNAL_ERROR: i64 = -32603
+
+pub struct RpcErrorObj {
+    code: i64,
+    message: string,
+    hasData: bool,
+    data: string,
+}
+
+pub fn rpcError(code: i64, message: string): RpcErrorObj {
+    return RpcErrorObj {
+        code: code, message: message, hasData: false, data: ""
+    }
+}
+
+// `dataJson` is already-serialized JSON (build it with Json.obj()/Json.arr()
+// ...build(), or pass a literal), spliced in verbatim — same convention as
+// JsonObj.raw, so a caller's own builder chain stays the only place that
+// knows its own shape.
+pub fn rpcErrorWithData(code: i64, message: string, dataJson: string): RpcErrorObj {
+    return RpcErrorObj {
+        code: code, message: message, hasData: true, data: dataJson
+    }
+}
+
+fn errorObjJson(e: &RpcErrorObj): string {
+    var o = Json.obj().int("code", e.code).str("message", e.message.clone())
+    if e.hasData {
+        o = o.raw("data", e.data.clone())
+    }
+    return o.build()
+}
+
+// ── Outgoing ──
+
+// resultJson/paramsJson are already-serialized JSON, spliced in verbatim.
+pub fn buildRequest(id: RpcId, method: &string, paramsJson: &string): string {
+    var o = Json.obj().str("jsonrpc", "2.0")
+    o = idField(o, id)
+    o = o.str("method", method.clone()).raw("params", paramsJson.clone())
+    return o.build()
+}
+
+pub fn buildNotification(method: &string, paramsJson: &string): string {
+    let o = Json.obj().str("jsonrpc", "2.0").str("method", method.clone()).raw("params", paramsJson.clone())
+    return o.build()
+}
+
+pub fn buildResponse(id: RpcId, resultJson: &string): string {
+    var o = Json.obj().str("jsonrpc", "2.0")
+    o = idField(o, id)
+    o = o.raw("result", resultJson.clone())
+    return o.build()
+}
+
+pub fn buildErrorResponse(id: RpcId, err: &RpcErrorObj): string {
+    var o = Json.obj().str("jsonrpc", "2.0")
+    o = idField(o, id)
+    o = o.raw("error", errorObjJson(err))
+    return o.build()
+}
+
+// ── Incoming ──
+
+pub struct RpcRequest {
+    id: RpcId,
+    method: string,
+    params: Json,
+    hasParams: bool,
+}
+
+pub struct RpcNotification {
+    method: string,
+    params: Json,
+    hasParams: bool,
+}
+
+pub struct RpcResponse {
+    id: RpcId,
+    result: Json,
+}
+
+pub struct RpcErrorResponse {
+    id: RpcId,
+    error: RpcErrorObj,
+}
+
+// A parsed frame body, classified by the fields it actually has — never a
+// best-effort guess. `Malformed` covers both "not valid JSON" and "valid
+// JSON but not a well-formed JSON-RPC envelope" (no `method` and no `id`, or
+// a `method` that isn't a string): a caller building a PARSE_ERROR/
+// INVALID_REQUEST response needs exactly this one signal to decide which.
+pub enum RpcMessage {
+    Request(RpcRequest),
+    Notification(RpcNotification),
+    Response(RpcResponse),
+    ErrorResponse(RpcErrorResponse),
+    Malformed,
+}
+
+fn readId(j: &Json): Option<RpcId> {
+    match j.i64("id") {
+        Option.Some(n) => {
+            return Option.Some(RpcId.IdNum(n))
+        }
+        Option.None => {
+        }
+    }
+    match j.str("id") {
+        Option.Some(s) => {
+            return Option.Some(RpcId.IdStr(s))
+        }
+        Option.None => {
+            return Option.None
+        }
+    }
+}
+
+pub fn parseMessage(body: &string): RpcMessage {
+    let Result.Ok(j) = Json.parse(body.clone()) else {
+        return RpcMessage.Malformed
+    }
+    let idOpt = readId(j)
+    let methodOpt = j.str("method")
+    if methodOpt.isSome() {
+        let method = methodOpt!
+        let paramsOpt = j.get("params")
+        var params = Json.parse("null")!
+        var hasParams = false
+        match paramsOpt {
+            Option.Some(p) => {
+                params = p
+                hasParams = true
+            }
+            Option.None => {
+            }
+        }
+        match idOpt {
+            Option.Some(id) => {
+                return RpcMessage.Request(RpcRequest {
+                    id: id, method: method, params: params, hasParams: hasParams
+                }
+                )
+            }
+            Option.None => {
+                return RpcMessage.Notification(RpcNotification {
+                    method: method, params: params, hasParams: hasParams
+                }
+                )
+            }
+        }
+    }
+    // No method: a response (result) or error response (error), correlated
+    // by id. Neither is well-formed without an id — a bare `{"jsonrpc":"2.0"}`
+    // is not a notification-shaped anything, it's malformed.
+    let Option.Some(id) = idOpt else {
+        return RpcMessage.Malformed
+    }
+    match j.get("error") {
+        Option.Some(errJson) => {
+            let code = errJson.i64("code") ?? PARSE_ERROR
+            let message = errJson.str("message") ?? ""
+            return RpcMessage.ErrorResponse(RpcErrorResponse {
+                id: id, error: rpcError(code, message)
+            }
+            )
+        }
+        Option.None => {
+        }
+    }
+    match j.get("result") {
+        Option.Some(r) => {
+            return RpcMessage.Response(RpcResponse {
+                id: id, result: r
+            }
+            )
+        }
+        Option.None => {
+            return RpcMessage.Malformed
+        }
+    }
+}
