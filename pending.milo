@@ -15,13 +15,17 @@ from "json-rpc" import {
     RpcId
 }
 
+// One in-flight-request table, generic over whatever value you want back
+// when a response arrives (a handler, a channel, a oneshot — the caller's
+// choice; this type doesn't know or care).
 pub struct PendingRequests<T> {
-    numeric: HashMap<i64, T>,
-    keyed: HashMap<string, T>,
-    nextNum: i64,
+    numeric: HashMap<i64, T>, // requests sent with an IdNum id
+    keyed: HashMap<string, T>, // requests sent with an IdStr id
+    nextNum: i64, // next value nextId() will hand out
 }
 
 impl PendingRequests<T> {
+    // An empty table; numeric ids start at 1 from the first nextId() call.
     fn new(): PendingRequests<T> {
         return PendingRequests {
             numeric: HashMap.new(), keyed: HashMap.new(), nextNum: 1
@@ -37,6 +41,8 @@ impl PendingRequests<T> {
         return RpcId.IdNum(n)
     }
 
+    // Record that `id` is now in flight, mapped to `val`. Pair with
+    // nextId() for numeric ids, or your own RpcId.IdStr for string ones.
     fn register(self: &mut Self, id: RpcId, val: T): void {
         match id {
             RpcId.IdNum(n) => {
@@ -48,6 +54,7 @@ impl PendingRequests<T> {
         }
     }
 
+    // Count of requests currently in flight (numeric + keyed combined).
     fn len(self: &Self): i64 {
         return self.numeric.len + self.keyed.len
     }

@@ -19,6 +19,13 @@ from "std/io" import {
     FdReader, fdReaderAttach
 }
 
+// One failure per distinct wire condition — see frameErrorMessage for
+// human-readable text. Eof and TruncatedBody are terminal for reading: the
+// peer is gone or the stream is corrupt, so close and stop. A bad header
+// (MissingContentLength, MalformedLength) is also effectively terminal —
+// once framing desyncs, the stream position can no longer be trusted to
+// point at the start of the next frame. ShortWrite is send-side only and
+// says nothing about the read path.
 pub enum FrameError {
     Eof, // stream closed before a header or body completed
     MissingContentLength, // header block had no Content-Length line
@@ -27,6 +34,9 @@ pub enum FrameError {
     ShortWrite, // write() accepted fewer bytes than the framed message
 }
 
+// Human-readable text for logging/eprint — not part of the wire protocol
+// and not meant to be parsed back. Match on the FrameError itself (not this
+// string) if your code needs to branch on which failure occurred.
 pub fn frameErrorMessage(e: &FrameError): string {
     match e {
         FrameError.Eof => {

@@ -21,8 +21,8 @@ from "std/json" import {
 // both to string would hand a client back `"3"` for a request it sent as the
 // number `3`, which is a protocol violation, not a formatting choice.
 pub enum RpcId {
-    IdNum(i64),
-    IdStr(string),
+    IdNum(i64), // id sent/received as a JSON number
+    IdStr(string), // id sent/received as a JSON string
 }
 
 impl RpcId {
@@ -43,6 +43,10 @@ impl RpcId {
     }
 }
 
+// Value equality across the RpcId variants. IdNum(3) and IdStr("3") are
+// never equal even though their text matches — the spec (§4) treats a
+// numeric id and a string id as distinct wire values, so this never coerces
+// between them.
 pub fn rpcIdEq(a: &RpcId, b: &RpcId): bool {
     match a {
         RpcId.IdNum(an) => {
@@ -80,23 +84,48 @@ fn idField(o: JsonObj, id: &RpcId): JsonObj {
 }
 
 // ── Standard error codes (JSON-RPC 2.0 spec §5.1) ──
+
+// The body wasn't valid JSON at all. This is one of the two cases
+// RpcMessage.Malformed collapses — see parseMessage for how to tell it
+// apart from INVALID_REQUEST.
 pub let PARSE_ERROR: i64 = -32700
 
+// Valid JSON, but not a well-formed JSON-RPC envelope (no `method` and no
+// `id`, or a `method` that isn't a string) — the other case
+// RpcMessage.Malformed collapses.
 pub let INVALID_REQUEST: i64 = -32600
 
+// The request's `method` doesn't match anything the server's dispatcher
+// knows how to handle. This package has no opinion on method names or a
+// built-in router — "doesn't match anything" is defined entirely by the
+// caller's own dispatch table.
 pub let METHOD_NOT_FOUND: i64 = -32601
 
+// The method was recognized but `params` failed validation: wrong shape,
+// wrong type, or a required field missing.
 pub let INVALID_PARAMS: i64 = -32602
 
+// Catch-all for a server-side failure unrelated to the request's shape (a
+// handler panicked, an I/O error, etc). Prefer a method-specific code when
+// the failure is something a client could reasonably act on.
 pub let INTERNAL_ERROR: i64 = -32603
 
+// The `error` member of a JSON-RPC error response (spec §5.1). Build one
+// with rpcError (no data) or rpcErrorWithData (with data) rather than
+// constructing this struct directly — hasData is what buildErrorResponse
+// checks to decide whether to emit the `data` field at all, not just what
+// its zero value happens to be, so it has to stay in sync with `data`.
 pub struct RpcErrorObj {
-    code: i64,
-    message: string,
-    hasData: bool,
-    data: string,
+    code: i64, // one of the PARSE_ERROR/... constants above, or a method-specific code
+    message: string, // short, human-readable summary; not for structured detail
+    hasData: bool, // true iff `data` should be serialized — see rpcErrorWithData
+    data: string, // already-serialized JSON, spliced in verbatim; meaningless unless hasData
 }
 
+// Build an error with one of the standard codes above (or a method-specific
+// code your own dispatcher defines) and no `data` field. Reach for
+// rpcErrorWithData instead when the client needs structured detail beyond
+// the message string — e.g. which field failed validation.
 pub fn rpcError(code: i64, message: string): RpcErrorObj {
     return RpcErrorObj {
         code: code, message: message, hasData: false, data: ""
@@ -122,8 +151,16 @@ fn errorObjJson(e: &RpcErrorObj): string {
 }
 
 // ── Outgoing ──
+//
+// paramsJson/resultJson below are already-serialized JSON, spliced in
+// verbatim — same convention as JsonObj.raw. Build them with
+// Json.obj()/Json.arr()...build(), pass a literal like "null" or "[1,2]", or
+// use jsonQuote(s) for a bare JSON string. A plain Milo string handed in
+// as-is (a caller's `name` variable, say) is NOT auto-quoted: it lands on
+// the wire unquoted, which is not valid JSON at that position.
 
-// resultJson/paramsJson are already-serialized JSON, spliced in verbatim.
+// Build a request envelope. Has both `method` and `id`, so the peer knows a
+// response is expected back, correlated by that same id.
 pub fn buildRequest(id: RpcId, method: &string, paramsJson: &string): string {
     var o = Json.obj().str("jsonrpc", "2.0")
     o = idField(o, id)
@@ -131,11 +168,17 @@ pub fn buildRequest(id: RpcId, method: &string, paramsJson: &string): string {
     return o.build()
 }
 
+// Build a notification envelope: like buildRequest but with no id, so the
+// peer must not reply. Use this for fire-and-forget events; if you need a
+// response, use buildRequest and register the id in a PendingRequests table.
 pub fn buildNotification(method: &string, paramsJson: &string): string {
     let o = Json.obj().str("jsonrpc", "2.0").str("method", method.clone()).raw("params", paramsJson.clone())
     return o.build()
 }
 
+// Build a success response. `id` must be the exact RpcId the request
+// carried — see rpcIdEq for why IdNum(3) and IdStr("3") are not
+// interchangeable substitutes for each other here.
 pub fn buildResponse(id: RpcId, resultJson: &string): string {
     var o = Json.obj().str("jsonrpc", "2.0")
     o = idField(o, id)
@@ -143,6 +186,10 @@ pub fn buildResponse(id: RpcId, resultJson: &string): string {
     return o.build()
 }
 
+// Build an error response for a request that failed, echoing its id and
+// serializing `err` (built with rpcError/rpcErrorWithData) into the `error`
+// member per spec §5.1. Never call this for a notification — it has no id
+// to reply to, so there is nothing to correlate the error back to.
 pub fn buildErrorResponse(id: RpcId, err: &RpcErrorObj): string {
     var o = Json.obj().str("jsonrpc", "2.0")
     o = idField(o, id)
@@ -152,24 +199,37 @@ pub fn buildErrorResponse(id: RpcId, err: &RpcErrorObj): string {
 
 // ── Incoming ──
 
+// A parsed incoming request: has both `method` and `id`, so a response is
+// expected back. `params` is Json.parse("null") when the wire message had
+// no `params` field at all — check `hasParams` first if you need to tell
+// "omitted" apart from "explicitly null".
 pub struct RpcRequest {
     id: RpcId,
     method: string,
     params: Json,
-    hasParams: bool,
+    hasParams: bool, // true iff the wire message had a `params` field at all
 }
 
+// A parsed incoming notification: has `method` but no `id` — nothing must
+// be sent back, and there is no id to send it to even if you wanted to.
+// Same params/hasParams contract as RpcRequest.
 pub struct RpcNotification {
     method: string,
     params: Json,
     hasParams: bool,
 }
 
+// A parsed incoming success response, correlated to the request that
+// triggered it via `id` — hand `id` to PendingRequests.take to find which
+// in-flight call this answers.
 pub struct RpcResponse {
     id: RpcId,
     result: Json,
 }
 
+// A parsed incoming error response — same correlation story as RpcResponse,
+// but the call failed; `error` (built server-side with rpcError/
+// rpcErrorWithData) says why.
 pub struct RpcErrorResponse {
     id: RpcId,
     error: RpcErrorObj,
@@ -181,11 +241,11 @@ pub struct RpcErrorResponse {
 // a `method` that isn't a string): a caller building a PARSE_ERROR/
 // INVALID_REQUEST response needs exactly this one signal to decide which.
 pub enum RpcMessage {
-    Request(RpcRequest),
-    Notification(RpcNotification),
-    Response(RpcResponse),
-    ErrorResponse(RpcErrorResponse),
-    Malformed,
+    Request(RpcRequest), // has method + id: a response is expected back
+    Notification(RpcNotification), // has method, no id: nothing sent back
+    Response(RpcResponse), // success reply to one of your own outgoing requests
+    ErrorResponse(RpcErrorResponse), // failure reply to one of your own outgoing requests
+    Malformed, // not valid JSON, or valid JSON that isn't a well-formed envelope
 }
 
 fn readId(j: &Json): Option<RpcId> {
@@ -206,6 +266,16 @@ fn readId(j: &Json): Option<RpcId> {
     }
 }
 
+// Classify a frame's raw JSON body into exactly one RpcMessage variant, by
+// which fields are actually present — never a best-effort guess. Dispatch
+// is keyed off shape (id/method/result/error present or absent), not the
+// `jsonrpc` version string, so a peer that omits it is still handled.
+//
+// On Malformed, the two spec-distinct cases — "not JSON at all" (PARSE_ERROR)
+// vs "valid JSON, not a well-formed envelope" (INVALID_REQUEST) — are NOT
+// distinguished in the return value. A server that wants to send back the
+// exact right code has to re-run Json.parse(body) itself to tell them apart;
+// one that's fine always answering PARSE_ERROR can skip that.
 pub fn parseMessage(body: &string): RpcMessage {
     let Result.Ok(j) = Json.parse(body.clone()) else {
         return RpcMessage.Malformed
