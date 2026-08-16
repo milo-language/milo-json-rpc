@@ -6,5 +6,5 @@
   "repository": "github.com/milo-language/milo-json-rpc",
   "lib": "lib.milo",
   "targets": ["darwin", "linux", "windows"],
-  "exclude": ["tests/**"]
+  "exclude": ["tests/**", "examples/**", "scripts/**", "docs/**"]
 }
