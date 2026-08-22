@@ -11,7 +11,11 @@
 // key type, so this keeps two maps rather than one keyed by a hand-rolled
 // RpcId hash. Any single request is in exactly one, so lookups never search
 // the wrong table.
-from "json-rpc" import {
+// Sibling module, reached relatively rather than by the package's own name:
+// "json-rpc" resolves through the dependency table, which this package does not
+// appear in when it is itself the dependency, so the self-named import compiled
+// as a root project and failed for every consumer.
+from "./lib" import {
     RpcId
 }
 
