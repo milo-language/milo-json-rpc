@@ -78,7 +78,7 @@ fn idField(o: JsonObj, id: &RpcId): JsonObj {
             return o.int("id", n)
         }
         RpcId.IdStr(s) => {
-            return o.str("id", s.clone())
+            return o.str("id", s)
         }
     }
 }
@@ -143,9 +143,9 @@ pub fn rpcErrorWithData(code: i64, message: string, dataJson: string): RpcErrorO
 }
 
 fn errorObjJson(e: &RpcErrorObj): string {
-    var o = Json.obj().int("code", e.code).str("message", e.message.clone())
+    var o = Json.obj().int("code", e.code).str("message", e.message)
     if e.hasData {
-        o = o.raw("data", e.data.clone())
+        o = o.raw("data", e.data)
     }
     return o.build()
 }
@@ -164,7 +164,7 @@ fn errorObjJson(e: &RpcErrorObj): string {
 pub fn buildRequest(id: RpcId, method: &string, paramsJson: &string): string {
     var o = Json.obj().str("jsonrpc", "2.0")
     o = idField(o, id)
-    o = o.str("method", method.clone()).raw("params", paramsJson.clone())
+    o = o.str("method", method).raw("params", paramsJson)
     return o.build()
 }
 
@@ -172,7 +172,7 @@ pub fn buildRequest(id: RpcId, method: &string, paramsJson: &string): string {
 // peer must not reply. Use this for fire-and-forget events; if you need a
 // response, use buildRequest and register the id in a PendingRequests table.
 pub fn buildNotification(method: &string, paramsJson: &string): string {
-    let o = Json.obj().str("jsonrpc", "2.0").str("method", method.clone()).raw("params", paramsJson.clone())
+    let o = Json.obj().str("jsonrpc", "2.0").str("method", method).raw("params", paramsJson)
     return o.build()
 }
 
@@ -182,7 +182,7 @@ pub fn buildNotification(method: &string, paramsJson: &string): string {
 pub fn buildResponse(id: RpcId, resultJson: &string): string {
     var o = Json.obj().str("jsonrpc", "2.0")
     o = idField(o, id)
-    o = o.raw("result", resultJson.clone())
+    o = o.raw("result", resultJson)
     return o.build()
 }
 
@@ -277,7 +277,7 @@ fn readId(j: &Json): Option<RpcId> {
 // exact right code has to re-run Json.parse(body) itself to tell them apart;
 // one that's fine always answering PARSE_ERROR can skip that.
 pub fn parseMessage(body: &string): RpcMessage {
-    let Result.Ok(j) = Json.parse(body.clone()) else {
+    let Result.Ok(j) = Json.parse(body) else {
         return RpcMessage.Malformed
     }
     let idOpt = readId(j)
